@@ -2,21 +2,30 @@
 
 这是一个逆向千问官方OpenWebUI站点 https://chat.qwen.ai 为本地API的项目，可以使用该站点的所有模型。
 
-~~本代码完全由qwen3-coder编写~~，有bug别找我，复制粘贴去找qwen3-coder。。。
+适用于各大AI客户端，**针对 Cherry Studio 的 MCP 进行优化**，不支持函数调用，暂不支持图片、文件上传，相关内容请自行解析为文字后拼接到消息中。
 
-单次Token输入最长为96000，超过该长度API不会返回任何内容。对于超长上下文的项目（如MCP）而言，逆向API能够节省的经费有限。
+目前暂未发现该网站针对逆向行为的限制，作者经过了反复、频繁的测试，依然未发现人机验证。
 
-## 功能特点
+单次Token输入最大为96000，超过该长度API不会返回任何内容。
 
-- 兼容 OpenAI API 格式，支持 `chat.completions` 接口
+没添加接口鉴权，有需要可自行添加（反正没损失）。当前情况下客户端的key可以任意填写。
+
+~~本代码由qwen3-coder和Claude 4.0 Sonnet合作编写~~，有bug别找我，复制粘贴去找他俩。。。
+
+## 功能支持
+
+- OpenAI API 格式，支持 `chat.completions` 接口
 - 支持流式和非流式响应，目前非流式工作原理为累计完整流式信息后拼接为非流式返回
 - 自动模型名称映射（将 OpenAI 模型名转换为 Qwen 模型ID）
 - 支持思维链（thinking）功能配置
 - 自动管理对话会话（创建和清理）
-- 支持 CORS，Health_Check端点，方便前端调用
+- 支持 CORS，Health_Check 端点，方便前端调用
+- v2.0：通过匹配最新AI回复的消息，实现原生连续对话。
+- v2.0：针对 Cherry Studio 的 MCP 功能优化，使 Cherry Studio 能够在使用MCP时进入原生多轮对话，而非每次创建新对话，导致token数量快速到达上限。
 
 ## 待添加功能
 
+- 图片上传与识别
 - 针对输入token过长的报错
 - 逆向生图、生视频功能
 - 逆向深度研究功能
@@ -31,18 +40,32 @@ pip install requests flask flask-cors
 
 直接修改文件内容即可，项目仅一个main.py文件。
 
-1. 通过环境变量设置认证令牌：
+1. 通过环境变量设置chat.qwen.ai网站的认证令牌：
    ```bash
    export QWEN_AUTH_TOKEN="your_auth_token_here"
    ```
 
    或直接在代码中修改 `QWEN_AUTH_TOKEN` 变量（不推荐用于生产环境）。
 
+> Token获取方法：
+>
+> ① 进入[chat.qwen.ai](https://chat.qwen.ai) ，并登录您的账号
+>
+> ② 打开 F12 开发者工具
+>
+> ③ 在顶端找到标签页“Applications/应用”
+>
+> ④ 在左侧找到“Local Storage/本地存储”，打开下拉菜单
+>
+> ⑤ 找到 chat.qwen.ai 并进入
+>
+> ⑥ 在右侧找到“token”的值，整段复制，该值即为 `QWEN_AUTH_TOKEN`
+
 2. 配置删除行为（可选）：
    - `IS_DELETE = 0`：不删除临时创建的对话（默认）
-   - `IS_DELETE = 1`：在请求完成后自动删除临时对话
+   - `IS_DELETE = 1`：在请求完成后自动删除临时对话。此时原生多轮对话将失效。
 
-3. 配置服务端运行端口，默认给出的是5000
+3. 配置服务端运行端口，默认使用5000
 
 4. 若有需要，可自行修改模型名映射，不会影响/v1/model/接口的返回内容。
 
@@ -64,6 +87,15 @@ python main.py
 - `GET /health` - 健康检查
 - `GET /v1/models` - 列出可用模型
 - `POST /v1/chat/completions` - 聊天补全接口（兼容 OpenAI 格式）
+
+## 支持参数
+
+- `model` - 该值可通过/v1/model/接口获得
+- `message` - 标准 OpenAI 格式的请求
+- `stream` - 是否流式响应，目前非流式响应通过拼接流式响应实现，不会节省时间。
+- `enable_thinking` - 是否深入思考，仅针对可深入思考的模型，无法深入思考的模型使用此参数无效。
+- `thinking_budget` - 深入思考预算，仅针对可深入思考的模型，无法深入思考的模型使用此参数无效。
+- 其他参数均无效，包括但不限于`max_tokens`、`temperature`、`top_p`等。
 
 ## 使用示例
 
@@ -96,7 +128,7 @@ curl http://localhost:5000/v1/chat/completions \
 
 ## 模型映射
 
-代理自动将 OpenAI 模型名称映射到对应的 Qwen 模型：
+代理自动将 OpenAI 模型名称映射到对应的 Qwen 模型，可自行在代码中配置：
 
 | OpenAI 模型   | Qwen 模型             |
 | ------------- | --------------------- |

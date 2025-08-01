@@ -5,19 +5,24 @@ import uuid
 import time
 import json
 import os
+import warnings
+import sqlite3
+import re
+import html
 from flask import Flask, request, jsonify, Response, stream_with_context
-from flask_cors import CORS # 引入 CORS
+from flask_cors import CORS
 
 # ==================== 配置区域 ====================
 # 请将您的有效 token 放在这里，或通过环境变量 QWEN_AUTH_TOKEN 设置
-# 获取方法：登录 chat.qwen.ai -> 开发者工具F12 -> 顶栏 Application/应用 -> 左侧栏 LocalStorage/本地存储 -> 下拉菜单 https://chat.qwen.ai -> 右侧找到token，整段复制值，放到下方
 QWEN_AUTH_TOKEN = os.environ.get("QWEN_AUTH_TOKEN")
 if not QWEN_AUTH_TOKEN:
     # 如果环境变量未设置，请在此处直接填写你的 token
     QWEN_AUTH_TOKEN = ""
-IS_DELETE = 0  # 是否在单次对话结束后删除对话记录，1 为删除，0 为不删除
-PORT = 5000  # 服务端运行端口
-# 模型名映射，基于实际返回的模型列表
+IS_DELETE = 0  # 是否在会话结束后自动删除会话
+PORT = 5000  # 服务端绑定的端口
+DEBUG_STATUS = False  # 是否输出debug信息
+DATABASE_PATH = "chat_history.db"  # 数据库文件路径
+# 模型映射，基于实际返回的模型列表
 MODEL_MAP = {
     "qwen": "qwen3-235b-a22b", # 默认旗舰模型
     "qwen3": "qwen3-235b-a22b",
@@ -35,6 +40,140 @@ MODEL_MAP = {
 }
 # =================================================
 
+os.environ['FLASK_ENV'] = 'production'  # 或 production
+os.environ['FLASK_DEBUG'] = '0'
+warnings.filterwarnings("ignore", message=".*development server.*")
+
+def debug_print(message):
+    """根据DEBUG_STATUS决定是否输出debug信息"""
+    if DEBUG_STATUS:
+        print(f"[DEBUG] {message}")
+
+def remove_tool(text):
+    # 使用正则表达式匹配 <tool_use>...</tool_use>，包括跨行内容
+    pattern = r'<tool_use>.*?</tool_use>'
+    # flags=re.DOTALL 使得 . 可以匹配换行符
+    cleaned_text = re.sub(pattern, '', text, flags=re.DOTALL)
+    return cleaned_text
+
+class ChatHistoryManager:
+    """管理聊天历史记录的本地存储"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """初始化数据库表结构"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    chat_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    chat_type TEXT,
+                    current_response_id TEXT,
+                    last_assistant_content TEXT
+                )
+            ''')
+            conn.commit()
+            debug_print("数据库初始化完成")
+        finally:
+            conn.close()
+    
+    def update_session(self, chat_id: str, title: str, created_at: int, updated_at: int, 
+                      chat_type: str, current_response_id: str, last_assistant_content: str):
+        """更新或插入会话记录"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO chat_sessions 
+                (chat_id, title, created_at, updated_at, chat_type, current_response_id, 
+                 last_assistant_content)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (chat_id, title, created_at, updated_at, chat_type, current_response_id,
+                  remove_tool(last_assistant_content)))
+            conn.commit()
+            debug_print(f"更新会话记录: {chat_id}")
+        finally:
+            conn.close()
+    
+    def get_session_by_last_content(self, content: str):
+        """根据最新AI回复内容查找会话"""
+        normalized_content = self.normalize_text(content)
+        debug_print(f"查找会话，标准化内容: {normalized_content[:100]}...")
+        
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT chat_id, current_response_id, last_assistant_content
+                FROM chat_sessions 
+                WHERE last_assistant_content IS NOT NULL
+            ''')
+            results = cursor.fetchall()
+            
+            debug_print(f"数据库中共有 {len(results)} 条会话记录")
+            
+            for row in results:
+                chat_id, current_response_id, stored_content = row
+                normalized_stored = self.normalize_text(stored_content)
+                debug_print(f"比较会话 {chat_id}...")
+                
+                if normalized_content == normalized_stored:
+                    debug_print(f"匹配成功！会话ID: {chat_id}")
+                    return {
+                        'chat_id': chat_id,
+                        'current_response_id': current_response_id
+                    }
+            
+            debug_print("未找到匹配的会话")
+            return None
+        finally:
+            conn.close()
+    
+    def delete_session(self, chat_id: str):
+        """删除会话记录"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM chat_sessions WHERE chat_id = ?', (chat_id,))
+            conn.commit()
+            debug_print(f"删除会话记录: {chat_id}")
+        finally:
+            conn.close()
+    
+    def clear_all_sessions(self):
+        """清空所有会话记录"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM chat_sessions')
+            conn.commit()
+            debug_print("清空所有会话记录")
+        finally:
+            conn.close()
+    
+    def normalize_text(self, text: str) -> str:
+        """标准化文本，处理转义字符、空白符等"""
+        if not text:
+            return ""
+        
+        # HTML解码
+        text = html.unescape(text)
+        # 去除多余空白字符
+        text = re.sub(r'\s+', ' ', text.strip())
+        # 去除常见的markdown符号
+        text = re.sub(r'[*_`~]', '', text)
+        # 去除emoji（简单处理）
+        text = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF✨🌟]', '', text)
+        
+        return text
+
 class QwenClient:
     """
     用于与 chat.qwen.ai API 交互的客户端。
@@ -44,6 +183,7 @@ class QwenClient:
         self.auth_token = auth_token
         self.base_url = base_url
         self.session = requests.Session()
+        self.history_manager = ChatHistoryManager(DATABASE_PATH)
         # 初始化时设置基本请求头
         self.session.headers.update({
             "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -54,6 +194,8 @@ class QwenClient:
         self.models_info = None
         self.user_settings = None
         self._initialize()
+        # 启动时同步历史记录
+        self.sync_history_from_cloud()
 
     def _initialize(self):
         """初始化客户端，获取用户信息、模型列表和用户设置"""
@@ -82,6 +224,83 @@ class QwenClient:
         """更新会话中的认证头"""
         self.session.headers.update({"authorization": f"Bearer {self.auth_token}"})
 
+    def sync_history_from_cloud(self):
+        """从云端同步历史记录到本地数据库"""
+        debug_print("开始从云端同步历史记录")
+        self._update_auth_header()
+        
+        try:
+            # 清空本地记录
+            self.history_manager.clear_all_sessions()
+            
+            page = 1
+            while True:
+                # 获取历史会话列表
+                list_url = f"{self.base_url}/api/v2/chats/?page={page}"
+                response = self.session.get(list_url)
+                response.raise_for_status()
+                data = response.json()
+                
+                if not data.get('success') or not data.get('data'):
+                    break
+                
+                sessions = data['data']
+                debug_print(f"第 {page} 页获取到 {len(sessions)} 个会话")
+                
+                if not sessions:
+                    break
+                
+                # 获取每个会话的详细信息
+                for session in sessions:
+                    chat_id = session['id']
+                    try:
+                        detail_url = f"{self.base_url}/api/v2/chats/{chat_id}"
+                        detail_response = self.session.get(detail_url)
+                        detail_response.raise_for_status()
+                        detail_data = detail_response.json()
+                        
+                        if not detail_data.get('success'):
+                            continue
+                        
+                        chat_detail = detail_data['data']
+                        messages = chat_detail.get('chat', {}).get('messages', [])
+                        
+                        # 提取最新的AI回复内容
+                        last_assistant_content = ""
+                        for msg in reversed(messages):
+                            if msg.get('role') == 'assistant':
+                                # 从content_list中提取内容
+                                content_list = msg.get('content_list', [])
+                                if content_list:
+                                    last_assistant_content = content_list[-1].get('content', '')
+                                else:
+                                    last_assistant_content = msg.get('content', '')
+                                break
+                        
+                        # 保存到本地数据库
+                        current_response_id = chat_detail.get('currentId', '')
+                        
+                        self.history_manager.update_session(
+                            chat_id=chat_id,
+                            title=session.get('title', ''),
+                            created_at=session.get('created_at', 0),
+                            updated_at=session.get('updated_at', 0),
+                            chat_type=session.get('chat_type', ''),
+                            current_response_id=current_response_id,
+                            last_assistant_content=last_assistant_content
+                        )
+                        
+                    except Exception as e:
+                        debug_print(f"获取会话 {chat_id} 详细信息失败: {e}")
+                        continue
+                
+                page += 1
+                
+            debug_print("历史记录同步完成")
+            
+        except Exception as e:
+            debug_print(f"同步历史记录失败: {e}")
+
     def _get_qwen_model_id(self, openai_model: str) -> str:
         """将 OpenAI 模型名称映射到 Qwen 模型 ID"""
         # 如果直接匹配到 key，则使用映射值；否则尝试看模型 ID 是否直接存在于 Qwen 模型列表中；最后回退到默认模型
@@ -109,10 +328,10 @@ class QwenClient:
             response = self.session.post(url, json=payload)
             response.raise_for_status()
             chat_id = response.json()['data']['id']
-            print(f"成功创建对话: {chat_id}")
+            debug_print(f"成功创建对话: {chat_id}")
             return chat_id
         except requests.exceptions.RequestException as e:
-            print(f"创建对话失败: {e}")
+            debug_print(f"创建对话失败: {e}")
             raise
 
     def delete_chat(self, chat_id: str):
@@ -120,21 +339,73 @@ class QwenClient:
         self._update_auth_header() # 确保 token 是最新的
         url = f"{self.base_url}/api/v2/chats/{chat_id}"
         
-        if IS_DELETE == 1:
-            try:
-                response = self.session.delete(url)
-                response.raise_for_status()
-                res_data = response.json()
-                if res_data.get('success', False):
-                    print(f"成功删除对话: {chat_id}")
-                else:
-                    print(f"删除对话 {chat_id} 返回 success=False: {res_data}")
-            except requests.exceptions.RequestException as e:
-                # 删除失败不应中断主流程，仅记录日志
-                print(f"删除对话失败 {chat_id}: {e}")
-            except json.JSONDecodeError:
-                print(f"删除对话时无法解析 JSON 响应 {chat_id}")
-        return
+        try:
+            response = self.session.delete(url)
+            response.raise_for_status()
+            res_data = response.json()
+            if res_data.get('success', False):
+                debug_print(f"成功删除对话: {chat_id}")
+                # 同时删除本地记录
+                self.history_manager.delete_session(chat_id)
+                return True
+            else:
+                debug_print(f"删除对话 {chat_id} 返回 success=False: {res_data}")
+                return False
+        except requests.exceptions.RequestException as e:
+            debug_print(f"删除对话失败 {chat_id}: {e}")
+            return False
+        except json.JSONDecodeError:
+            debug_print(f"删除对话时无法解析 JSON 响应 {chat_id}")
+            return False
+
+    def find_matching_session(self, messages: list):
+        """根据消息历史查找匹配的会话"""
+        debug_print("开始查找匹配的会话")
+        
+        # 检查是否有AI回复历史
+        last_assistant_message = None
+        for msg in reversed(messages):
+            if msg.get('role') == 'assistant':
+                last_assistant_message = msg
+                break
+        
+        if not last_assistant_message:
+            debug_print("请求中没有AI回复历史，将创建新会话")
+            return None
+        
+        last_content = last_assistant_message.get('content', '')
+        if not last_content:
+            debug_print("最新AI回复内容为空，将创建新会话")
+            return None
+        
+        debug_print("查找匹配...")
+        
+        # 查找匹配的会话
+        matched_session = self.history_manager.get_session_by_last_content(last_content)
+        
+        if matched_session:
+            debug_print(f"找到匹配的会话: {matched_session['chat_id']}")
+            return matched_session
+        else:
+            debug_print("未找到匹配的会话，将创建新会话")
+            return None
+
+    def update_session_after_chat(self, chat_id: str, title: str, messages: list, 
+                                  current_response_id: str, assistant_content: str):
+        """聊天结束后更新会话记录"""
+        debug_print(f"更新会话记录: {chat_id}")
+        
+        current_time = int(time.time())
+        
+        self.history_manager.update_session(
+            chat_id=chat_id,
+            title=title,
+            created_at=current_time,
+            updated_at=current_time,
+            chat_type="t2t",
+            current_response_id=current_response_id,
+            last_assistant_content=assistant_content
+        )
 
     def chat_completions(self, openai_request: dict):
         """
@@ -154,14 +425,41 @@ class QwenClient:
         # 映射模型
         qwen_model_id = self._get_qwen_model_id(model)
 
-        # 拼接上下文消息
-        formatted_history = "\n\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
-        if messages[0]['role'] != "system":
-            formatted_history = "system:\n\n" + formatted_history
-        user_input = formatted_history
+        debug_print(f"收到聊天请求，消息数量: {len(messages)}, 模型: {qwen_model_id}")
+        # debug_print(f"收到的完整请求: \n{openai_request}\n")
 
-        # 创建新对话
-        chat_id = self.create_chat(qwen_model_id, title=f"OpenAI_API_对话_{int(time.time())}")
+        # 查找匹配的现有会话
+        matched_session = self.find_matching_session(messages)
+        
+        chat_id = None
+        parent_id = None
+        user_input = ""
+        
+        if matched_session:
+            # 使用现有会话进行增量聊天
+            chat_id = matched_session['chat_id']
+            parent_id = matched_session['current_response_id']
+            
+            # 只取最新的用户消息
+            for msg in reversed(messages):
+                if msg.get('role') == 'user':
+                    user_input = msg.get('content', '')
+                    break
+            
+            debug_print(f"使用现有会话 {chat_id}，parent_id: {parent_id}")
+            # debug_print(f"用户输入: {user_input[:100]}...")
+            
+        else:
+            # 创建新会话，拼接所有消息
+            formatted_history = "\n\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
+            if messages and messages[0]['role'] != "system":
+                formatted_history = "system:\n\n" + formatted_history
+            user_input = formatted_history
+            
+            chat_id = self.create_chat(qwen_model_id, title=f"OpenAI_API_对话_{int(time.time())}")
+            parent_id = None
+            
+            debug_print(f"创建新会话 {chat_id}")
 
         try:
             # 准备请求负载
@@ -190,10 +488,10 @@ class QwenClient:
                 "chat_id": chat_id,
                 "chat_mode": "normal",
                 "model": qwen_model_id,
-                "parent_id": None,
+                "parent_id": parent_id,
                 "messages": [{
                     "fid": str(uuid.uuid4()),
-                    "parentId": None,
+                    "parentId": parent_id,
                     "childrenIds": [str(uuid.uuid4())],
                     "role": "user",
                     "content": user_input,
@@ -205,7 +503,7 @@ class QwenClient:
                     "feature_config": feature_config,
                     "extra": {"meta": {"subChatType": "t2t"}},
                     "sub_chat_type": "t2t",
-                    "parent_id": None
+                    "parent_id": parent_id
                 }],
                 "timestamp": timestamp_ms
             }
@@ -226,15 +524,15 @@ class QwenClient:
                             r.raise_for_status()
                             finish_reason = "stop"
                             reasoning_text = ""  # 用于累积 thinking 阶段的内容
+                            assistant_content = ""  # 用于累积assistant回复内容
                             has_sent_content = False # 标记是否已经开始发送 answer 内容
+                            current_response_id = None  # 当前回复ID
 
                             for line in r.iter_lines(decode_unicode=True):
                                 # 检查标准的 SSE 前缀
                                 if line.startswith("data: "):
                                     data_str = line[6:]  # 移除 'data: '
                                     if data_str.strip() == "[DONE]":
-                                        # 在发送最终块之前，如果还有未发送的 reasoning_text，发送它
-                                        # （理论上 finished 块应该已经处理了，但作为后备）
                                         # 发送最终的 done 消息块，包含 finish_reason
                                         final_chunk = {
                                             "id": f"chatcmpl-{chat_id[:10]}",
@@ -243,8 +541,6 @@ class QwenClient:
                                             "model": model,
                                             "choices": [{
                                                 "index": 0,
-                                                # 如果从未发送过 content，最后一次发送空 delta 和 finish_reason
-                                                # 如果发送过，这次也发送 finish_reason
                                                 "delta": {}, 
                                                 "finish_reason": finish_reason
                                             }]
@@ -254,6 +550,12 @@ class QwenClient:
                                         break
                                     try:
                                         data = json.loads(data_str)
+                                        
+                                        # 提取response_id
+                                        if "response.created" in data:
+                                            current_response_id = data["response.created"].get("response_id")
+                                            debug_print(f"获取到response_id: {current_response_id}")
+                                        
                                         # 处理 choices 数据
                                         if "choices" in data and len(data["choices"]) > 0:
                                             choice = data["choices"][0]
@@ -271,10 +573,11 @@ class QwenClient:
                                                 # 注意：think 阶段的内容不直接发送，只累积
 
                                             # 2. 处理 "answer" 阶段 或 无明确 phase 的内容 (兼容性)
-                                            #    (有些早期数据块可能没有 phase，但包含实际回复内容)
                                             elif phase == "answer" or (phase is None and content):
                                                 # 一旦进入 answer 阶段或有内容，标记为已开始
                                                 has_sent_content = True 
+                                                assistant_content += content  # 累积assistant回复
+                                                
                                                 # 构造包含 content 的流式块
                                                 openai_chunk = {
                                                     "id": f"chatcmpl-{chat_id[:10]}",
@@ -287,8 +590,7 @@ class QwenClient:
                                                         "finish_reason": None # answer 阶段进行中不设 finish_reason
                                                     }]
                                                 }
-                                                # 如果累积了 reasoning_text，则在第一个 answer 块或包含 content 的块中附带
-                                                # 并在发送后清空，避免重复发送
+                                                # 如果累积了 reasoning_text，则在第一个 answer 块中附带
                                                 if reasoning_text:
                                                      openai_chunk["choices"][0]["delta"]["reasoning_content"] = reasoning_text
                                                      reasoning_text = "" # 发送后清空
@@ -298,19 +600,11 @@ class QwenClient:
                                             # 3. 处理结束信号 (通常在 answer 阶段的最后一个块)
                                             if status == "finished":
                                                 finish_reason = delta.get("finish_reason", "stop")
-                                                # 注意：[DONE] 信号会触发最终块的发送，所以这里不需要再 yield 一个带 finish_reason 的块
-                                                # 除非我们想在 [DONE] 之前发送最后一个内容块同时带 finish_reason，
-                                                # 但标准做法是在 [DONE] 时发送。
-                                                # 当前逻辑是在 [DONE] 时发送最终块。
-
-                                            # --- 重构逻辑结束 ---
 
                                     except json.JSONDecodeError:
-                                        # 忽略无效的 JSON 行，但可以考虑记录警告
-                                        # print(f"Warning: Skipping invalid JSON line: {line}")
                                         continue
                     except requests.exceptions.RequestException as e:
-                        print(f"流式请求失败: {e}")
+                        debug_print(f"流式请求失败: {e}")
                         # 发送一个错误块
                         error_chunk = {
                             "id": f"chatcmpl-error",
@@ -325,8 +619,22 @@ class QwenClient:
                         }
                         yield f"data: {json.dumps(error_chunk)}\n\n"
                     finally:
-                        # 请求结束后删除对话
-                        self.delete_chat(chat_id)
+                        # 聊天结束后更新会话记录
+                        if assistant_content and current_response_id:
+                            # 构建完整的消息历史
+                            updated_messages = messages.copy()
+                            updated_messages.append({
+                                "role": "assistant",
+                                "content": assistant_content
+                            })
+                            
+                            self.update_session_after_chat(
+                                chat_id=chat_id,
+                                title=f"OpenAI_API_对话_{int(time.time())}",
+                                messages=updated_messages,
+                                current_response_id=current_response_id,
+                                assistant_content=assistant_content
+                            )
 
                 return generate()
 
@@ -336,6 +644,8 @@ class QwenClient:
                 reasoning_text = "" # 用于聚合 thinking 阶段的内容
                 finish_reason = "stop"
                 usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                current_response_id = None
+                
                 try:
                     with self.session.post(url, json=payload, headers=headers, stream=True) as r:
                         r.raise_for_status()
@@ -347,6 +657,10 @@ class QwenClient:
                                     break
                                 try:
                                     data = json.loads(data_str)
+                                    
+                                    # 提取response_id
+                                    if "response.created" in data:
+                                        current_response_id = data["response.created"].get("response_id")
                                     
                                     # 处理 choices 数据来构建最终回复
                                     if "choices" in data and len(data["choices"]) > 0:
@@ -381,6 +695,23 @@ class QwenClient:
                                     # 忽略无法解析的行
                                     continue
                     
+                    # 聊天结束后更新会话记录
+                    if response_text and current_response_id:
+                        # 构建完整的消息历史
+                        updated_messages = messages.copy()
+                        updated_messages.append({
+                            "role": "assistant",
+                            "content": response_text
+                        })
+                        
+                        self.update_session_after_chat(
+                            chat_id=chat_id,
+                            title=f"OpenAI_API_对话_{int(time.time())}",
+                            messages=updated_messages,
+                            current_response_id=current_response_id,
+                            assistant_content=response_text
+                        )
+                    
                     # 构造非流式的 OpenAI 响应
                     openai_response = {
                         "id": f"chatcmpl-{chat_id[:10]}",
@@ -404,13 +735,10 @@ class QwenClient:
                     
                     return jsonify(openai_response)
                 finally:
-                    # 请求结束后删除对话
-                    self.delete_chat(chat_id)
+                    pass  # 不再自动删除会话
 
         except requests.exceptions.RequestException as e:
-            # 确保在出错时也尝试删除对话
-            self.delete_chat(chat_id)
-            print(f"聊天补全失败: {e}")
+            debug_print(f"聊天补全失败: {e}")
             # 返回 OpenAI 格式的错误
             return jsonify({
                 "error": {
@@ -480,10 +808,30 @@ def chat_completions():
             # 如果是非流式响应，`result` 是一个 Flask Response 对象 (jsonify)
             return result
     except Exception as e:
-        print(f"处理聊天补全请求时发生未预期错误: {e}")
+        debug_print(f"处理聊天补全请求时发生未预期错误: {e}")
         return jsonify({
             "error": {
                 "message": f"内部服务器错误: {str(e)}",
+                "type": "server_error",
+                "param": None,
+                "code": None
+            }
+        }), 500
+
+@app.route('/v1/chats/<chat_id>', methods=['DELETE'])
+def delete_chat(chat_id):
+    """删除指定的对话"""
+    try:
+        success = qwen_client.delete_chat(chat_id)
+        if success:
+            return jsonify({"message": f"会话 {chat_id} 已删除", "success": True})
+        else:
+            return jsonify({"message": f"删除会话 {chat_id} 失败", "success": False}), 400
+    except Exception as e:
+        debug_print(f"删除会话时发生错误: {e}")
+        return jsonify({
+            "error": {
+                "message": f"删除会话失败: {str(e)}",
                 "type": "server_error",
                 "param": None,
                 "code": None
@@ -505,7 +853,6 @@ def health_check():
     return jsonify({"status": "healthy"}), 200
 
 if __name__ == '__main__':
-    # 从环境变量获取端口，默认为 5000
-    port = int(os.environ.get("PORT", PORT))
-    print(f"正在启动服务器于端口 {port}...")
-    app.run(host='0.0.0.0', port=port, debug=False) # 生产环境请关闭 debug
+    print(f"正在启动服务器于端口 {PORT}...")
+    print(f"Debug模式: {'开启' if DEBUG_STATUS else '关闭'}")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
