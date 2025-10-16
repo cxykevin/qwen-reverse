@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  qwen-reverse:
+    build: .
+    image: qwen-reverse-alpine
+    container_name: qwen-reverse
+    ports:
+      - "5000:5000"
+    environment:
+      - QWEN_AUTH_TOKEN=${QWEN_AUTH_TOKEN}  # 从环境变量读取
+      - PORT=5000
+      - DEBUG_STATUS=false
+    restart: unless-stopped
+    volumes:
+      - ./chat_history.db:/app/chat_history.db  # 持久化聊天历史数据库
+      - ./logs:/app/logs  # 可选：持久化日志文件
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # 网络配置（可选）
+    networks:
+      - qwen-network
+
+# 自定义网络
+networks:
+  qwen-network:
+    driver: bridge
+
+# 环境变量文件（可选，创建 .env 文件）
+# QWEN_AUTH_TOKEN=your_auth_token_here
+# PORT=5000
+# DEBUG_STATUS=false
